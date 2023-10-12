@@ -1,0 +1,11 @@
+<expr> ::= <ignored> (<symbol> | <appl> | <str>) <ignored>
+
+<cmt1> ::= "This list is incomplete:"
+<any> ::= [A-z] | [0-9] | " " | "\n" | "_" | "-" | "\"" | "?" | "#" | "/" | "=" 
+
+<str> ::= "\"" <any>*  "\""
+<appl> ::= "(" <expr>* ")"
+<ignored> ::= (" " | "\n" | <comment>)*
+<comment> ::= ";" <any>* "\n"*
+<symbol> ::= <letter>+
+<letter> ::= [A-z] | [0-9] 

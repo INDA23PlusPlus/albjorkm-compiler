@@ -124,7 +124,7 @@ const Parser = struct {
                 self.index += 1;
                 break;
             }
-            var new_cursor = @truncate(u32, self.nodes.items.len);
+            var new_cursor: u32 = @truncate(self.nodes.items.len);
             try self.nodes.append(ASTNode{ .list = ASTList{ .next = AST_EMPTY_LIST, .elem = AST_EMPTY_LIST } });
             if (id == AST_EMPTY_LIST) {
                 id = new_cursor;
@@ -140,7 +140,7 @@ const Parser = struct {
     }
     fn parse_expr(self: *Parser, tokens: *Tokens.Slice) std.mem.Allocator.Error!u32 {
         var token = tokens.get(self.index);
-        var id = @truncate(u32, self.nodes.items.len);
+        var id: u32 = @truncate(self.nodes.items.len);
         switch (token.tag) {
             .l_par => {
                 self.index += 1;

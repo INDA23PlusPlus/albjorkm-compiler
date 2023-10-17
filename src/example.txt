@@ -1,0 +1,57 @@
+(
+    (
+        (lambda (c)
+            (let b (+ c 1)
+                (lambda (d)
+                    (let e (+ b 1)
+                        (+ e d)
+                    )
+                )
+            )
+        )
+        1
+    )
+    2
+)
+
+; the problem:
+(lambda (c)
+    (let b (lambda (x) (+ c x))
+        (b 2)
+    )
+)
+; can be written using only lambdas... but the problem remains.
+
+
+
+LAMBDA3
+POP
+SET A
+
+POP
+SET B
+
+POP
+SET C
+
+LAMBDA0
+RET
+
+LAMBDA0
+RET
+
+RET
+
+
+
+LAMBDA1
+BIND A
+
+LAMBDA1
+GET A
+CONST 1
+ADD
+END
+
+UNBIND
+RET

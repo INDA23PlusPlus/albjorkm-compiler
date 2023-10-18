@@ -26,7 +26,7 @@ const TokenizerError = error{unexpected_char};
 
 fn isSymbolToken(c: u8) bool {
     return switch(c) {
-        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        'a'...'z', 'A'...'Z', '0'...'9', '+', '-' => true,
         else => false,
     };
 }
@@ -53,7 +53,7 @@ const Tokenizer = struct {
                     },
                     '(' => try self.addToken(.l_par),
                     ')' => try self.addToken(.r_par),
-                    'a'...'z', 'A'...'Z', '0'...'9' => {
+                    'a'...'z', 'A'...'Z', '0'...'9','+','-' => {
                         self.state = .symbol;
                         try self.addToken(.symbol);
                     },
@@ -209,10 +209,8 @@ const RPNTag = enum {
     get_captured,
     get_by_hops,
     get_captured_by_hops,
-    unbind,
-    const_num,
+    push_number,
     call,
-    add,
     str,
     lambda_ret,
 };
@@ -226,10 +224,8 @@ const RPN = union(RPNTag) {
     get_captured: []u8,
     get_by_hops: usize,
     get_captured_by_hops: usize,
-    unbind: usize,
-    const_num: usize,
+    push_number: i64,
     call: usize,
-    add: usize,
     str: usize,
     lambda_ret: usize,
 
@@ -239,6 +235,7 @@ const RPN = union(RPNTag) {
         switch (value.?) {
             .get, .get_captured, .bind, .bind_captured => |sym| try writer.print("{s}({s})", .{@tagName(value.?), sym}),
             .call, .get_by_hops, .get_captured_by_hops => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
+            .push_number => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
             else => try writer.print("{s}", .{@tagName(value.?)}),
         }
     }
@@ -299,42 +296,53 @@ const RPNConverter = struct {
         }
         self.rpn.items[lambda_index] = RPN{.lambda = arg_count};
 
-        try self.exprToRPN(expr, false);
+        try self.exprToRPN(expr);
 
         try self.rpn.append(RPN{.lambda_ret = undefined});
     }
 
-    fn exprToRPN(self: *RPNConverter, at: u32, in_list: bool) std.mem.Allocator.Error!void {
+    fn listToRPN(self: *RPNConverter, at: u32) std.mem.Allocator.Error!void {
+        var list = self.assertList(at);
+        while (true) {
+            try self.exprToRPN(list.elem);
+            if (list.next == AST_EMPTY_LIST) {
+                break;
+            }
+            list = self.assertList(list.next);
+        }
+    }
+
+    fn exprToRPN(self: *RPNConverter, at: u32) std.mem.Allocator.Error!void {
         if (at == AST_EMPTY_LIST) {
             return;
         }
         switch (self.parser.nodes.items[at]) {
             .list => |v| {
-                if (!in_list) {
-                    if (v.next == AST_EMPTY_LIST) {
-                        @panic("empty call detected");
-                    }
-                    switch (self.parser.nodes.items[v.elem]) {
-                        .symbol => |s| {
-                            const symbol = tokenToSymbol(self.source, s.source_start);
-                            if (std.mem.eql(u8, symbol, "lambda")) {
-                                try self.lambdaToRPN(v.next);
-                                return;
-                            }
-                        },
-                        else => {},
-                    }
+                if (v.next == AST_EMPTY_LIST) {
+                    @panic("empty call detected");
                 }
-                try self.exprToRPN(v.elem, false);
-                try self.exprToRPN(v.next, true);
-
-                if (!in_list) {
-                    var call_arity = self.listLength(v.next);
-                    try self.rpn.append(RPN{.call = call_arity});
+                switch (self.parser.nodes.items[v.elem]) {
+                    .symbol => |s| {
+                        const symbol = tokenToSymbol(self.source, s.source_start);
+                        if (std.mem.eql(u8, symbol, "lambda")) {
+                            try self.lambdaToRPN(v.next);
+                            return;
+                        }
+                    },
+                    else => {},
                 }
+                try self.listToRPN(v.next);
+                try self.exprToRPN(v.elem);
+                var call_arity = self.listLength(v.next);
+                try self.rpn.append(RPN{.call = call_arity});
             },
             .symbol => |v| {
-                try self.rpn.append(RPN{.get = tokenToSymbol(self.source, v.source_start)});
+                const symbol = tokenToSymbol(self.source, v.source_start);
+                if (std.fmt.parseInt(i64, symbol, 10)) |num| {
+                    try self.rpn.append(RPN{.push_number = num});
+                } else |_| {
+                    try self.rpn.append(RPN{.get = tokenToSymbol(self.source, v.source_start)});
+                }
             },
             .string => |v| {
                 try self.rpn.append(RPN{.str = v.source_start});
@@ -476,34 +484,68 @@ fn rpnFindLambdas(rpn: []RPN, list: *std.ArrayList(usize)) !void {
     }
 }
 
+fn builtinName(sym: []u8) []const u8 {
+    if (std.mem.eql(u8, sym, "+")) {
+        return "sup_builtin_add";
+    }
+
+    std.debug.panic("unknown primitive: {s}", .{sym});
+}
+
+fn codegenInstructionC(rpn: []RPN, i: usize, writer: *std.ArrayList(u8).Writer) !void {
+    switch (rpn[i]) {
+        .bind => try writer.print("    supBind();\n", .{}),
+        .bind_captured => try writer.print("    supBindCaptured();\n", .{}),
+        .get_by_hops => |hops| try writer.print("    supGet({d});\n", .{hops}),
+        .get_captured_by_hops => |hops| try writer.print("    supGetCaptured({d});\n", .{hops}),
+        .call => try writer.print("    supCall();\n", .{}),
+        .get => |sym| {
+            var name = builtinName(sym);
+            try writer.print("    supPushLambda(&{s});\n", .{name});
+        },
+        .push_number => |n| try writer.print("    supPushNumber({d});\n", .{n}),
+        else => std.debug.panic("attempting to generate unsupported instruction: {any} ", .{rpn[i]}),
+    }
+}
+
+
 fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
     var depth: usize = 0;
     for(start..rpn.len) |i| {
         switch (rpn[i]) {
             .lambda_ret => {
                 if (depth == 1) {
-                    try writer.print("}}\n", .{});
+                    try writer.print(
+                        \\    context_stack = old_context;
+                        \\}}
+                        \\struct ManagedType lambda_type_{d} = {{
+                        \\    "lambda",
+                        \\    &Lambda{d}
+                        \\}};
+                        \\
+                    , .{start, start});
                     return;
                 }
                 depth -= 1;
             },
             .lambda => {
                 if (depth != 0) {
-                    try writer.print("    supPushLambda(&LAMBDA_{d});\n", .{i});
+                    try writer.print("    supPushLambda(&lambda_type_{d});\n", .{i});
                 } else {
-                    try writer.print("void LAMBDA_{d}() {{\n", .{i});
+                    try writer.print(
+                        \\void Lambda{d}() {{
+                        \\    struct HeapVariable *old_context = context_stack;
+                        \\    // Don't forget to restore the stack later.
+                        \\    context_stack = top.v.context;
+                        \\    supStackDrop();
+                        \\
+                    , .{start});
                 }
                 depth += 1;
             },
             else => {
-                if (depth != 1) {
-                    continue;
-                }
-                switch (rpn[i]) {
-                    .bind => try writer.print("    supBind();\n", .{}),
-                    .get_by_hops => |hops| try writer.print("    supGet({d});\n", .{hops}),
-                    .call => try writer.print("    supCall();\n", .{}),
-                    else => {}
+                if (depth == 1) {
+                    try codegenInstructionC(rpn, i, writer);
                 }
             }
         }
@@ -698,41 +740,52 @@ pub fn main() !void {
         .rpn = std.ArrayList(RPN).init(allocator),
         .parser = &parser,
     };
-    try rpnConverter.exprToRPN(start, false);
+    try rpnConverter.exprToRPN(start);
     rpnDetectCaptured(rpnConverter.rpn.items);
     rpnFixGetCaptures(rpnConverter.rpn.items);
     rpnConvertGetToGetBySteps(rpnConverter.rpn.items);
     try rpnFindLambdas(rpnConverter.rpn.items, &lambdas);
 
 
-    std.debug.print("RPN:\n{any}\n", .{rpnConverter.rpn.items});
+    std.debug.print("\n// RPN: {any}\n", .{rpnConverter.rpn.items});
 
 
     var output = std.ArrayList(u8).init(allocator);
     var writer = output.writer();
-
+    try writer.print("#include \"support.h\"\n", .{});
     var i = lambdas.items.len;
     while(i > 0) {
         i -= 1;
         var lambda_start = lambdas.items[i];
         try codegenC(rpnConverter.rpn.items, lambda_start, &writer);
     }
-    std.debug.print("output:\n{s}\n", .{output.items});
+    try writer.print(
+        \\int main(int argc, const char **args) {{
+        \\    supPushNumber(argc);
+        \\    supPushLambda(&lambda_type_0);
+        \\    supCall();
+        \\    return top.v.number;
+        \\}}
+    , .{});
+    std.debug.print("// output:\n", .{});
 
+    const stdout_file = std.io.getStdOut().writer();
+    var bw = std.io.bufferedWriter(stdout_file);
+    const stdout = bw.writer();
+    try stdout.print("{s}\n", .{output.items});
+    try bw.flush();
 
     // stdout is for the actual output of your application, for example if you
     // are implementing gzip, then only the compressed bytes should be sent to
     // stdout, not any debugging messages.
-    //const stdout_file = std.io.getStdOut().writer();
     //var bw = std.io.bufferedWriter(stdout_file);
     //const stdout = bw.writer();
     //try stdout.print("Run `zig build test` to run the tests.\n", .{});
     //try bw.flush(); // don't forget to flush!
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+// demonstrates higher-order functions:
+// echo "(lambda (x z) (lambda (y z) (add x y)))" | zig run src\main.zig
+
+// this works:
+// echo "(lambda (x) (+ x 1))" | zig run src\main.zig | wsl gcc -g3 -I src -xc -

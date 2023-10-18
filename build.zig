@@ -15,18 +15,20 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const support = b.addStaticLibrary(.{
-        .name = "LOLFramework",
-        .root_source_file = .{ .path = "src/support.zig" },
-        .target = target,
-        .optimize = optimize,
-    });
+    // const support = b.addStaticLibrary(.{
+    //     .name = "LOLFramework",
+    //     .root_source_file = .{ .path = "src/support.zig" },
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
 
     const support_unit_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/support.zig" },
         .target = target,
         .optimize = optimize,
     });
+    support_unit_tests.linkLibC();
+    support_unit_tests.addIncludePath(.{ .path = "src" });
 
     const exe = b.addExecutable(.{
         .name = "LispOriginatingLanguage",
@@ -36,13 +38,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.step.dependOn(&support.step);
+    //exe.step.dependOn(&support.step);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
     b.installArtifact(exe);
-    b.installArtifact(support);
+    //b.installArtifact(support);
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish

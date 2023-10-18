@@ -517,10 +517,11 @@ fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
                 if (depth == 1) {
                     try writer.print(
                         \\    context_stack = old_context;
+                        \\    binds_index = old_binds_index;
                         \\}}
                         \\struct ManagedType lambda_type_{d} = {{
                         \\    "lambda",
-                        \\    &Lambda{d}
+                        \\    &genLambda{d}
                         \\}};
                         \\
                     , .{start, start});
@@ -533,11 +534,12 @@ fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
                     try writer.print("    supPushLambda(&lambda_type_{d});\n", .{i});
                 } else {
                     try writer.print(
-                        \\void Lambda{d}() {{
+                        \\void genLambda{d}() {{
                         \\    struct HeapVariable *old_context = context_stack;
-                        \\    // Don't forget to restore the stack later.
+                        \\    BindsIndex old_binds_index = binds_index;
                         \\    context_stack = top.v.context;
                         \\    supStackDrop();
+                        \\    // Don't forget to restore the stack and binds later.
                         \\
                     , .{start});
                 }
@@ -789,3 +791,6 @@ pub fn main() !void {
 
 // this works:
 // echo "(lambda (x) (+ x 1))" | zig run src\main.zig | wsl gcc -g3 -I src -xc -
+
+// this also works now:
+// echo "(lambda (x) ((lambda (a b) (+ a b)) x 1))" | zig run src\main.zig

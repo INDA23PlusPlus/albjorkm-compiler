@@ -64,7 +64,8 @@ struct ManagedVariable top;
 unsigned int stack_index = 0;
 
 struct ManagedVariable binds[1024];
-unsigned int binds_index = 0;
+typedef unsigned int BindsIndex;
+BindsIndex binds_index = 0;
 
 
 static inline void supStackDup() {
@@ -97,6 +98,7 @@ static inline void supGet(int n) {
 static inline void supBind() {
     binds_index++;
     binds[binds_index] = top;
+    supStackDrop();
 }
 
 static inline void supGetCaptured(int n) {

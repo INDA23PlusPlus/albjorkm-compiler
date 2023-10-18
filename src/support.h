@@ -134,4 +134,17 @@ struct ManagedType sup_builtin_add = {
     "add", (const void*)supAddBuiltin
 };
 
+static inline void supSubtractBuiltin() {
+    stack_index--;
+    i64 a = stack[stack_index].v.number;
+    stack_index--;
+    top.type = &type_number;
+    top.v.number = stack[stack_index].v.number - a;
+}
+
+struct ManagedType sup_builtin_subtract = {
+    "subtract", (const void*)supSubtractBuiltin
+};
+
+
 #endif

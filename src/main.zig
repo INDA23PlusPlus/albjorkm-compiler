@@ -203,6 +203,9 @@ const Parser = struct {
 const RPNTag = enum {
     placeholder,
     lambda,
+    lambda_ret,
+    scope_begin,
+    scope_end,
     bind,
     bind_captured,
     get,
@@ -212,12 +215,14 @@ const RPNTag = enum {
     push_number,
     call,
     str,
-    lambda_ret,
 };
 
 const RPN = union(RPNTag) {
     placeholder: usize,
     lambda: usize,
+    lambda_ret: usize,
+    scope_begin: usize,
+    scope_end: usize,
     bind: []u8,
     bind_captured: []u8,
     get: []u8,
@@ -227,21 +232,18 @@ const RPN = union(RPNTag) {
     push_number: i64,
     call: usize,
     str: usize,
-    lambda_ret: usize,
 
     pub fn format(value: ?RPN, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
         _ = options;
         _ = fmt;
         switch (value.?) {
             .get, .get_captured, .bind, .bind_captured => |sym| try writer.print("{s}({s})", .{@tagName(value.?), sym}),
-            .call, .get_by_hops, .get_captured_by_hops => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
+            .scope_begin, .scope_end, .call, .get_by_hops, .get_captured_by_hops => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
             .push_number => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
             else => try writer.print("{s}", .{@tagName(value.?)}),
         }
     }
 };
-
-
 
 const RPNConverter = struct {
     source: []u8,
@@ -283,6 +285,7 @@ const RPNConverter = struct {
 
         var lambda_index = self.rpn.items.len;
         try self.rpn.append(RPN{.lambda = undefined});
+        try self.rpn.append(RPN{.scope_begin = lambda_index + 1});
 
         var arg_count: u32 = 0;
         while (true) {
@@ -298,6 +301,7 @@ const RPNConverter = struct {
 
         try self.exprToRPN(expr);
 
+        try self.rpn.append(RPN{.scope_end = lambda_index + 1});
         try self.rpn.append(RPN{.lambda_ret = undefined});
     }
 
@@ -352,6 +356,7 @@ const RPNConverter = struct {
 };
 
 fn rpnDetectCaptured(rpn: []RPN) void {
+    // TODO: Detect if in same lambda but different scope.
     for(0..rpn.len) |i| {
         switch (rpn[i]) {
             .get => |search| {
@@ -366,8 +371,8 @@ fn rpnDetectCaptured(rpn: []RPN) void {
                                 break;
                             }
                         },
-                        .lambda_ret => depth += 1,
-                        .lambda => depth -= 1,
+                        .scope_begin => depth -= 1,
+                        .scope_end => depth += 1,
                         else => {}
                     }
                     if (j == 0) {
@@ -402,8 +407,8 @@ fn rpnFixGetCaptures(rpn: []RPN) void {
                                 break;
                             }
                         },
-                        .lambda_ret => depth += 1,
-                        .lambda => depth -= 1,
+                        .scope_begin => depth -= 1,
+                        .scope_end => depth += 1,
                         else => {}
                     }
                     if (j == 0) {
@@ -435,8 +440,8 @@ fn rpnConvertGetToGetBySteps(rpn: []RPN) void {
                                 steps += 1;
                             }
                         },
-                        .lambda_ret => depth += 1,
-                        .lambda => depth -= 1,
+                        .scope_begin => depth -= 1,
+                        .scope_end => depth += 1,
                         else => {}
                     }
                     if (j == 0) {
@@ -460,8 +465,8 @@ fn rpnConvertGetToGetBySteps(rpn: []RPN) void {
                                 steps += 1;
                             }
                         },
-                        .lambda_ret => depth += 1,
-                        .lambda => depth -= 1,
+                        .scope_end => depth += 1,
+                        .scope_begin => depth -= 1,
                         else => {}
                     }
                     if (j == 0) {
@@ -488,6 +493,9 @@ fn builtinName(sym: []u8) []const u8 {
     if (std.mem.eql(u8, sym, "+")) {
         return "sup_builtin_add";
     }
+    if (std.mem.eql(u8, sym, "-")) {
+        return "sup_builtin_subtract";
+    }
 
     std.debug.panic("unknown primitive: {s}", .{sym});
 }
@@ -504,20 +512,46 @@ fn codegenInstructionC(rpn: []RPN, i: usize, writer: *std.ArrayList(u8).Writer) 
             try writer.print("    supPushLambda(&{s});\n", .{name});
         },
         .push_number => |n| try writer.print("    supPushNumber({d});\n", .{n}),
+        .scope_begin => |id| {
+            try writer.print(
+                \\    struct HeapVariable *scope_{d}_context = context_stack;
+                \\    BindsIndex scope_{d}_binds_index = binds_index;
+                \\    context_stack = top.v.context;
+                \\
+            , .{id, id});
+        },
+        .scope_end => |id| {
+            try writer.print(
+                \\    context_stack = scope_{d}_context;
+                \\    binds_index = scope_{d}_binds_index;
+                \\
+            , .{id, id});
+        },
         else => std.debug.panic("attempting to generate unsupported instruction: {any} ", .{rpn[i]}),
     }
 }
 
 
 fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
+    // TODO: Don't count depth, instead search for the end using ID as that is more robust.
     var depth: usize = 0;
     for(start..rpn.len) |i| {
         switch (rpn[i]) {
+            .lambda => {
+                if (depth != 0) {
+                    try writer.print("    supPushLambda(&lambda_type_{d});\n", .{i});
+                } else {
+                    try writer.print(
+                        \\void genLambda{d}() {{
+                        \\    supStackDrop();
+                        \\
+                    , .{start});
+                }
+                depth += 1;
+            },
             .lambda_ret => {
                 if (depth == 1) {
                     try writer.print(
-                        \\    context_stack = old_context;
-                        \\    binds_index = old_binds_index;
                         \\}}
                         \\struct ManagedType lambda_type_{d} = {{
                         \\    "lambda",
@@ -529,22 +563,6 @@ fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
                 }
                 depth -= 1;
             },
-            .lambda => {
-                if (depth != 0) {
-                    try writer.print("    supPushLambda(&lambda_type_{d});\n", .{i});
-                } else {
-                    try writer.print(
-                        \\void genLambda{d}() {{
-                        \\    struct HeapVariable *old_context = context_stack;
-                        \\    BindsIndex old_binds_index = binds_index;
-                        \\    context_stack = top.v.context;
-                        \\    supStackDrop();
-                        \\    // Don't forget to restore the stack and binds later.
-                        \\
-                    , .{start});
-                }
-                depth += 1;
-            },
             else => {
                 if (depth == 1) {
                     try codegenInstructionC(rpn, i, writer);
@@ -553,124 +571,6 @@ fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
         }
     }
 }
-
-
-// const context_begin = "(context_begin)";
-// const context_primitive = "(primitve)";
-// 
-
-// const CompileBinding = struct {
-//     name: []const char,
-//     next: ?*CompileBinding,
-// };
-// 
-// const CompileContext = struct {
-//     previous: ?*const CompileContext,
-//     stack: usize,
-//     bindings: ?*CompileBinding,
-//     source: []u8,
-//     writer: *std.ArrayList(u8).Writer
-// };
-// // 
-// // 
-// // const context_top = CompileContext {
-// //     .previous = undefined,
-// //     .index = 0,
-// //     .name = "(context_end)",
-// // };
-// // 
-// fn compileSymbolLookup(ctx: ?*CompileContext, into: *CompileContext, symbol: []u8, ) !void {
-//     var current = ctx;
-//     var ctx_index: usize = 0;
-//     var ctx_levels_up: usize = 0;
-//     while (ctx != null) {
-//         ctx_levels_up += 1;
-// 
-//     }
-//     while (true) {
-//         if (std.mem.eql(u8, current.name, symbol)) {
-//             ctx_index = current.index;
-//             break;
-//         }
-//         current = current.previous;
-//         if (current == &context_top) {
-//             std.debug.panic("unknown symbol: {s}\n", .{symbol}); // TODO: handle better
-//             return;
-//         }
-//     }
-// 
-//     try writer.print("   context_ptr[{d}] = context_lookup({d}, {d});\n", .{into.index, ctx_levels_up, ctx_index});
-// }
-// 
-// fn compileNormalCall(ctx: *const CompileContext, allocator: std.mem.Allocator, parser: *Parser, source: []u8, at: u32, writer: *std.ArrayList(u8).Writer) !*const CompileContext {
-//     var current_ctx = ctx;
-//     var argument_count = 0;
-//     while (true) {
-//         if (at == AST_EMPTY_LIST) {
-//             break;
-//         }
-//         switch (parser.nodes.items[at]) {
-//             .list => |v| {
-//                 argument_count += 1;
-// 
-//                 compileExpr();
-// 
-//                 at = v.next;
-//             },
-//             else => @panic("strange list detected during compilation"),
-//         }
-//     }
-// }
-// fn compileCall(ctx: *const CompileContext, allocator: std.mem.Allocator, parser: *Parser, source: []u8, at: u32, writer: *std.ArrayList(u8).Writer) !*const CompileContext {
-//     if (at == AST_EMPTY_LIST) {
-//         @panic("empty call!");
-//     }
-//     switch (parser.nodes.items[at]) {
-//         .symbol => |v| {
-//             const sym = tokenToSymbol(v.source_start);
-//             if (std.mem.eql(u8, sym, "lambda")) {
-//                 var into = &(try allocator.alloc(CompileContext, 1))[0];
-//                 into.previous = ctx;
-//                 into.name = context_primitive;
-//                 into.index = ctx.index + 1;
-//                 return into;
-//             }
-//         },
-//         else => return try compileExpr(ctx, allocator, parser, source, at, writer),
-//     }
-// }
-// 
-// 
-// fn compileExpr(ctx: *const CompileContext, allocator: std.mem.Allocator, parser: *Parser, source: []u8, at: u32, writer: *std.ArrayList(u8).Writer) !*const CompileContext {
-//     if (at == AST_EMPTY_LIST) {
-//         return &context_top;
-//     }
-// 
-//     var into = &(try allocator.alloc(CompileContext, 1))[0];
-//     into.previous = ctx;
-//     into.name = "";
-//     into.index = ctx.index + 1;
-//     switch (parser.nodes.items[at]) {
-//         .list => |v| {
-//             try writer.print("// begin apply\n", .{});
-//             const call_ctx = try compileCall(ctx, allocator, parser, source, v.elem, writer);
-//             if (call_ctx.name == context_primitive) {
-//                 try writer.print("    // do primitive\n", .{});
-//             } else {
-//                 _ = try compileNormalCall(ctx2, allocator, parser, source, v.next, writer);
-//             }
-//             try writer.print("// end apply\n", .{});
-//         },
-//         .symbol => |v| {
-//             const symbol = tokenToSymbol(source, v.source_start);
-//             try compileSymbolLookup(ctx, into, symbol, writer);
-//         },
-//         .string => |v| {
-//             try writer.print("    context_ptr[{d}] = make_string(\"{d}\");", .{into.index, v.source_start});
-//         },
-//     }
-//     return into;
-// }
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -722,20 +622,9 @@ pub fn main() !void {
     };
 
     var start = try parser.parseExpr(&slice);
-    //std.debug.print("start: {d}\nnodes:{any}\n", .{ start, parser.nodes.items });
     std.debug.print("// ", .{});
     parser.prettyPrint(start, false);
 
-    //var output = std.ArrayList(u8).init(allocator);
-    //var writer = output.writer();
-    //var ctx = CompileContext {
-    //    .name = "test",
-    //
-    //.previous = &context_top,
-    //    .index = 0,
-    //};
-    //var c = try compileExpr(&ctx, allocator, &parser, tokenizer.source.items, start, &writer, false);
-    //std.debug.print("\n// c: {any}\n// output:\n{s}\n", .{c, output.items});
     var lambdas = std.ArrayList(usize).init(allocator);
     var rpnConverter = RPNConverter {
         .source = tokenizer.source.items,

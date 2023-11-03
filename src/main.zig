@@ -26,7 +26,7 @@ const TokenizerError = error{unexpected_char};
 
 fn isSymbolToken(c: u8) bool {
     return switch(c) {
-        'a'...'z', 'A'...'Z', '0'...'9', '+', '-' => true,
+        'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '=', '<' => true,
         else => false,
     };
 }
@@ -53,7 +53,7 @@ const Tokenizer = struct {
                     },
                     '(' => try self.addToken(.l_par),
                     ')' => try self.addToken(.r_par),
-                    'a'...'z', 'A'...'Z', '0'...'9','+','-' => {
+                    'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '=', '<' => {
                         self.state = .symbol;
                         try self.addToken(.symbol);
                     },
@@ -203,11 +203,19 @@ const Parser = struct {
 const RPNTag = enum {
     placeholder,
     lambda,
+    lambda_context_load,
     lambda_ret,
     scope_begin,
     scope_end,
+    condition_start,
+    condition_else,
+    condition_end,
     bind,
     bind_captured,
+    set,
+    set_captured,
+    set_by_hops,
+    set_captured_by_hops,
     get,
     get_captured,
     get_by_hops,
@@ -220,11 +228,19 @@ const RPNTag = enum {
 const RPN = union(RPNTag) {
     placeholder: usize,
     lambda: usize,
+    lambda_context_load: usize,
     lambda_ret: usize,
     scope_begin: usize,
     scope_end: usize,
+    condition_start: usize,
+    condition_else: usize,
+    condition_end: usize,
     bind: []u8,
     bind_captured: []u8,
+    set: []u8,
+    set_captured: []u8,
+    set_by_hops: usize,
+    set_captured_by_hops: usize,
     get: []u8,
     get_captured: []u8,
     get_by_hops: usize,
@@ -237,7 +253,7 @@ const RPN = union(RPNTag) {
         _ = options;
         _ = fmt;
         switch (value.?) {
-            .get, .get_captured, .bind, .bind_captured => |sym| try writer.print("{s}({s})", .{@tagName(value.?), sym}),
+            .set, .get, .get_captured, .bind, .bind_captured => |sym| try writer.print("{s}({s})", .{@tagName(value.?), sym}),
             .scope_begin, .scope_end, .call, .get_by_hops, .get_captured_by_hops => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
             .push_number => |num| try writer.print("{s}({d})", .{@tagName(value.?), num}),
             else => try writer.print("{s}", .{@tagName(value.?)}),
@@ -286,6 +302,7 @@ const RPNConverter = struct {
         var lambda_index = self.rpn.items.len;
         try self.rpn.append(RPN{.lambda = undefined});
         try self.rpn.append(RPN{.scope_begin = lambda_index + 1});
+        try self.rpn.append(RPN{.lambda_context_load = undefined});
 
         var arg_count: u32 = 0;
         while (true) {
@@ -305,6 +322,36 @@ const RPNConverter = struct {
         try self.rpn.append(RPN{.lambda_ret = undefined});
     }
 
+    fn scopedExprToRPN(self: *RPNConverter, n: u32) std.mem.Allocator.Error!void {
+        var scope_id = self.rpn.items.len;
+        try self.rpn.append(RPN{.scope_begin = scope_id});
+        try self.exprToRPN(n);
+        try self.rpn.append(RPN{.scope_end = scope_id});
+    }
+
+    fn ifToRPN(self: *RPNConverter, n: u32) std.mem.Allocator.Error!void {
+        var list = self.assertList(n);
+
+        try self.scopedExprToRPN(list.elem);
+
+        var positive_branch = self.assertList(list.next);
+        var condition_start_index = self.rpn.items.len;
+        try self.rpn.append(RPN{.condition_start = undefined});
+        try self.scopedExprToRPN(positive_branch.elem);
+
+        var negative_branch = self.assertList(positive_branch.next);
+        var condition_else_index = self.rpn.items.len;
+        try self.rpn.append(RPN{.condition_else = undefined});
+        try self.scopedExprToRPN(negative_branch.elem);
+
+        var condition_end_index = self.rpn.items.len;
+        try self.rpn.append(RPN{.condition_end = undefined});
+
+        // Link the conditions.
+        self.rpn.items[condition_start_index] = RPN{.condition_start = condition_else_index};
+        self.rpn.items[condition_else_index] = RPN{.condition_else = condition_end_index};
+    }
+
     fn listToRPN(self: *RPNConverter, at: u32) std.mem.Allocator.Error!void {
         var list = self.assertList(at);
         while (true) {
@@ -314,6 +361,36 @@ const RPNConverter = struct {
             }
             list = self.assertList(list.next);
         }
+    }
+
+    fn letToRPN(self: *RPNConverter, at: u32) std.mem.Allocator.Error!void {
+        var list = self.assertList(at);
+        var statements = self.assertList(list.elem);
+
+        var scope_id = self.rpn.items.len;
+        try self.rpn.append(RPN{.scope_begin = scope_id});
+        while (true) {
+            var symbol = self.assertSymbol(statements.elem);
+            statements = self.assertList(statements.next);
+            var expr = statements.elem;
+
+            try self.rpn.append(RPN{.push_number = 0});
+            try self.rpn.append(RPN{.bind = tokenToSymbol(self.source, symbol.source_start)});
+
+            try self.exprToRPN(expr);
+
+            try self.rpn.append(RPN{.set = tokenToSymbol(self.source, symbol.source_start)});
+
+            if (statements.next == AST_EMPTY_LIST) {
+                break;
+            }
+            list = self.assertList(list.next);
+        }
+
+        var expression = self.assertList(list.next);
+        try self.exprToRPN(expression.elem);
+
+        try self.rpn.append(RPN{.scope_end = scope_id});
     }
 
     fn exprToRPN(self: *RPNConverter, at: u32) std.mem.Allocator.Error!void {
@@ -330,6 +407,14 @@ const RPNConverter = struct {
                         const symbol = tokenToSymbol(self.source, s.source_start);
                         if (std.mem.eql(u8, symbol, "lambda")) {
                             try self.lambdaToRPN(v.next);
+                            return;
+                        }
+                        if (std.mem.eql(u8, symbol, "if")) {
+                            try self.ifToRPN(v.next);
+                            return;
+                        }
+                        if (std.mem.eql(u8, symbol, "let")) {
+                            try self.letToRPN(v.next);
                             return;
                         }
                     },
@@ -359,16 +444,23 @@ fn rpnDetectCaptured(rpn: []RPN) void {
     // TODO: Detect if in same lambda but different scope.
     for(0..rpn.len) |i| {
         switch (rpn[i]) {
-            .get => |search| {
+            .set, .get => |search| {
                 var depth: i32 = 0;
                 var j = i;
+                var lambda_passed = false;
                 while(true) {
                     switch (rpn[j]) {
                         .bind => |found| {
                             if (depth < 0
-                                and std.mem.eql(u8, search, found)) {
+                                and std.mem.eql(u8, search, found)
+                                and lambda_passed) {
                                 rpn[j] = RPN{.bind_captured = found};
                                 break;
+                            }
+                        },
+                        .lambda_context_load => {
+                            if (depth <= 0) {
+                                lambda_passed = true;
                             }
                         },
                         .scope_begin => depth -= 1,
@@ -421,6 +513,43 @@ fn rpnFixGetCaptures(rpn: []RPN) void {
         }
     }
 }
+
+fn rpnFixSetCaptures(rpn: []RPN) void {
+    for(0..rpn.len) |i| {
+        switch (rpn[i]) {
+            .set => |search| {
+                var depth: i32 = 0;
+                var j = i;
+                while(true) {
+                    switch (rpn[j]) {
+                        .bind_captured => |found| {
+                            if (depth <= 0
+                                and std.mem.eql(u8, found, search)) {
+                                rpn[i] = RPN{.set_captured = search};
+                                break;
+                            }
+                        },
+                        .bind => |found| {
+                            if (depth <= 0
+                                and std.mem.eql(u8, found, search)) {
+                                break;
+                            }
+                        },
+                        .scope_begin => depth -= 1,
+                        .scope_end => depth += 1,
+                        else => {}
+                    }
+                    if (j == 0) {
+                        break;
+                    }
+                    j -= 1;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 
 fn rpnConvertGetToGetBySteps(rpn: []RPN) void {
     for(0..rpn.len) |i| {
@@ -480,6 +609,65 @@ fn rpnConvertGetToGetBySteps(rpn: []RPN) void {
     }
 }
 
+fn rpnConvertSetToSetBySteps(rpn: []RPN) void {
+    for(0..rpn.len) |i| {
+        switch (rpn[i]) {
+            .set => |search| {
+                var depth: i32 = 0;
+                var steps: usize = 0;
+                var j = i;
+                while(true) {
+                    switch (rpn[j]) {
+                        .bind => |found| {
+                            if (depth <= 0) {
+                                if (std.mem.eql(u8, search, found)) {
+                                    rpn[i] = RPN{.set_by_hops = steps};
+                                    break;
+                                }
+                                steps += 1;
+                            }
+                        },
+                        .scope_begin => depth -= 1,
+                        .scope_end => depth += 1,
+                        else => {}
+                    }
+                    if (j == 0) {
+                        break;
+                    }
+                    j -= 1;
+                }
+            },
+            .set_captured => |search| {
+                var depth: i32 = 0;
+                var steps: usize = 0;
+                var j = i;
+                while(true) {
+                    switch (rpn[j]) {
+                        .bind_captured => |found| {
+                            if (depth <= 0) {
+                                if (std.mem.eql(u8, search, found)) {
+                                    rpn[i] = RPN{.set_captured_by_hops = steps};
+                                    break;
+                                }
+                                steps += 1;
+                            }
+                        },
+                        .scope_end => depth += 1,
+                        .scope_begin => depth -= 1,
+                        else => {}
+                    }
+                    if (j == 0) {
+                        break;
+                    }
+                    j -= 1;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+
 fn rpnFindLambdas(rpn: []RPN, list: *std.ArrayList(usize)) !void {
     for(0..rpn.len) |i| {
         switch (rpn[i]) {
@@ -496,27 +684,61 @@ fn builtinName(sym: []u8) []const u8 {
     if (std.mem.eql(u8, sym, "-")) {
         return "sup_builtin_subtract";
     }
+    if (std.mem.eql(u8, sym, "=")) {
+        return "sup_builtin_equals";
+    }
+    if (std.mem.eql(u8, sym, "or")) {
+        return "sup_builtin_bitwise_or";
+    }
+    if (std.mem.eql(u8, sym, "and")) {
+        return "sup_builtin_bitwise_and";
+    }
+    if (std.mem.eql(u8, sym, "<")) {
+        return "sup_builtin_less_than";
+    }
+    if (std.mem.eql(u8, sym, "prog-arg")) {
+        return "sup_builtin_program_argument";
+    }
+    if (std.mem.eql(u8, sym, "str-to-num")) {
+        return "sup_builtin_string_to_number";
+    }
+    if (std.mem.eql(u8, sym, "num-to-str")) {
+        return "sup_builtin_number_to_string";
+    }
+    if (std.mem.eql(u8, sym, "put-str")) {
+        return "sup_builtin_put_string";
+    }
+
 
     std.debug.panic("unknown primitive: {s}", .{sym});
 }
 
 fn codegenInstructionC(rpn: []RPN, i: usize, writer: *std.ArrayList(u8).Writer) !void {
     switch (rpn[i]) {
+        .lambda_context_load => try writer.print(
+            \\    context_stack = top.v.context;
+            \\    supStackDrop();
+            \\
+            , .{}),
+        .condition_start => try writer.print("    if (top.v.number) {{\n    supStackDrop();\n", .{}),
+        .condition_else => try writer.print("    }} else {{\n    supStackDrop();\n", .{}),
+        .condition_end => try writer.print("    }}\n", .{}),
         .bind => try writer.print("    supBind();\n", .{}),
         .bind_captured => try writer.print("    supBindCaptured();\n", .{}),
+        .set_by_hops => |hops| try writer.print("    supSet({d});\n", .{hops}),
+        .set_captured_by_hops => |hops| try writer.print("    supSetCaptured({d});\n", .{hops}),
         .get_by_hops => |hops| try writer.print("    supGet({d});\n", .{hops}),
         .get_captured_by_hops => |hops| try writer.print("    supGetCaptured({d});\n", .{hops}),
-        .call => try writer.print("    supCall();\n", .{}),
         .get => |sym| {
             var name = builtinName(sym);
             try writer.print("    supPushLambda(&{s});\n", .{name});
         },
+        .call => try writer.print("    supCall();\n", .{}),
         .push_number => |n| try writer.print("    supPushNumber({d});\n", .{n}),
         .scope_begin => |id| {
             try writer.print(
                 \\    struct HeapVariable *scope_{d}_context = context_stack;
                 \\    BindsIndex scope_{d}_binds_index = binds_index;
-                \\    context_stack = top.v.context;
                 \\
             , .{id, id});
         },
@@ -541,11 +763,7 @@ fn codegenC(rpn: []RPN, start: usize, writer: *std.ArrayList(u8).Writer) !void {
                 if (depth != 0) {
                     try writer.print("    supPushLambda(&lambda_type_{d});\n", .{i});
                 } else {
-                    try writer.print(
-                        \\void genLambda{d}() {{
-                        \\    supStackDrop();
-                        \\
-                    , .{start});
+                    try writer.print("void genLambda{d}() {{\n", .{start});
                 }
                 depth += 1;
             },
@@ -634,7 +852,9 @@ pub fn main() !void {
     try rpnConverter.exprToRPN(start);
     rpnDetectCaptured(rpnConverter.rpn.items);
     rpnFixGetCaptures(rpnConverter.rpn.items);
+    rpnFixSetCaptures(rpnConverter.rpn.items);
     rpnConvertGetToGetBySteps(rpnConverter.rpn.items);
+    rpnConvertSetToSetBySteps(rpnConverter.rpn.items);
     try rpnFindLambdas(rpnConverter.rpn.items, &lambdas);
 
 
@@ -652,6 +872,8 @@ pub fn main() !void {
     }
     try writer.print(
         \\int main(int argc, const char **args) {{
+        \\    program_args = args;
+        \\    program_args_count = argc;
         \\    supPushNumber(argc);
         \\    supPushLambda(&lambda_type_0);
         \\    supCall();
@@ -665,21 +887,16 @@ pub fn main() !void {
     const stdout = bw.writer();
     try stdout.print("{s}\n", .{output.items});
     try bw.flush();
-
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    //var bw = std.io.bufferedWriter(stdout_file);
-    //const stdout = bw.writer();
-    //try stdout.print("Run `zig build test` to run the tests.\n", .{});
-    //try bw.flush(); // don't forget to flush!
 }
 
 // demonstrates higher-order functions:
-// echo "(lambda (x z) (lambda (y z) (add x y)))" | zig run src\main.zig
+// echo "(lambda (x z) (lambda (y z) (+ x y)))" | zig run src\main.zig
 
 // this works:
 // echo "(lambda (x) (+ x 1))" | zig run src\main.zig | wsl gcc -g3 -I src -xc -
 
 // this also works now:
 // echo "(lambda (x) ((lambda (a b) (+ a b)) x 1))" | zig run src\main.zig
+
+// higher order function working example:
+// echo "(lambda (x) ((lambda (y) (+ x y)) 332))" | zig build run
